@@ -1,0 +1,1827 @@
+#!/usr/bin/env perl
+# ts=4
+# Warren Block
+# special thanks to Glen Barber for limitless
+# patience and the use of his svn repository
+
+# igor: check man pages and DocBook
+# needs Perl 5.8 or higher
+
+use strict;
+use warnings;
+use locale;
+
+#  Copyright (c) 2012, 2013, 2014 Warren Block
+#  All rights reserved.
+#
+#  Redistribution and use in source and binary forms, with or without
+#  modification, are permitted provided that the following conditions
+#  are met:
+#  1. Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer.
+#  2. Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the distribution.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+#  ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+#  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+#  ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+#  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+#  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+#  OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+#  HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+#  LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+#  OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+#  SUCH DAMAGE.
+
+use Getopt::Std;
+use File::Basename;
+use POSIX qw/strftime/;
+
+my $file  = "/usr/bin/file";
+my $gzcat = "/usr/bin/gzcat";
+my $bzcat = "/usr/bin/bzcat";
+my $man   = "/usr/bin/man";
+
+my $tmpdir = "/tmp";
+
+my $rev = '$Revision: 430 $';
+
+my ($fh, $tmpfile, $stdinfile, $docdate);
+
+my ($prevline, $prevnonblank, $origline) = ('', '');
+my $ignoreblock;
+my $titleblock = 0;
+my $today;
+
+my $linelensgml;
+my ($startline, $stopline);
+my ($ignoreblockstart, $ignoreblockend);
+my %misspelled_words;
+my @badphrases;
+my @contractions;
+my @freebsdobs;
+my ($lc_regex, $uc_regex, $ignoreregex);
+my ($indent_regex, $inline_regex);
+my ($redundantword_regex, $redundanttagword_regex);
+my (@straggler_tags, $literalblock_regex);
+my $eos_regex;
+my (@openclose_tags, $openclose_regex, %opentag, $list_regex, $parawrap_regex);
+
+my ($bname, $type);
+
+my $prog = basename($0);
+
+sub usage {
+	$rev =~ /Revision: (\d+)/;
+	my $version = "1.$1";
+	print <<USAGE;
+$prog $version
+usage: $prog -h
+       $prog [-abcdefilmnorstuwxyzDERSWZ] [-C range] [-L n] file [file ...]
+
+    -h  show summary of command line options and exit
+
+    Output options
+        -R        ANSI highlights (use with 'less -R')
+        -C range  Restrict output to a range of lines from the source file
+        -v        Verbose output
+
+    Tests
+        If individual test options are given, only those tests are done.
+
+    Shortcuts
+        -z  all standard non-whitespace tests
+        -Z  all standard whitespace tests
+
+    Tests for all files
+        -a  abbreviations like "e.g.," and "i.e.,"
+        -b  bad phrases
+        -f  FreeBSD obsolete features
+        -r  repeated words
+        -s  spelling
+        -u  contractions
+        -w  whitespace
+        -y  style suggestions (off by default)
+
+    mdoc(7) tests
+        -d  document date (.Dd)
+        -e  sentences should begin on a new line
+        -g  See Also xrefs are not duplicated
+        -m  mdoc structure requirements
+        -x  additional xref (.Xr) tests (off by default, implies -m)
+        -D  all but document date (same as -abefmrsuw)
+
+    DocBook tests
+        -c  title capitalization
+        -i  indentation
+        -l  long lines (see -L below)
+        -n  sentences start with two spaces
+        -o  open/close tags match
+        -t  tag usage style
+        -E  writing style
+        -S  straggler tags on lines after content
+        -W  whitespace on SGML indentation
+
+    DocBook test options
+        -L n  set line length used in long line test (default 70)
+
+    EXAMPLES
+
+        $prog -R gpart.8.gz | less -R -S
+        $prog -R -D -y /usr/share/man/man7/tuning.7.gz | less -R -S
+        cat /usr/share/man/man1/csh.1.gz | $prog -D
+        $prog -Rz chapter.sgml | less -RS
+        $prog -R `find /usr/doc/en_US.ISO8859-1/ -name "*.xml"` | less -RS
+        $prog -RD /usr/share/man/man8/* | less -RS
+
+    gzip and bzip2 files are automatically decompressed.
+USAGE
+	exit 0;
+}
+
+our ($opt_a, $opt_b, $opt_c, $opt_d, $opt_e, $opt_f, $opt_g, $opt_h,
+	 $opt_i, $opt_l, $opt_m, $opt_n, $opt_o, $opt_r, $opt_s, $opt_t,
+	 $opt_u, $opt_v, $opt_w, $opt_x, $opt_y, $opt_z, $opt_C, $opt_E,
+	 $opt_D, $opt_L, $opt_R, $opt_S, $opt_W, $opt_Z);
+
+getopts('abcdefghilmnorstuvwxyzC:DEL:RSWZ');
+
+usage() if $opt_h;
+
+my $verbose = 1 if $opt_v;
+
+# ANSI color codes
+my @colors = qw/ red green yellow blue magenta cyan /;
+my %ansi;
+my $inverse  = "\033[7m";
+my $reset    = "\033[0;24;27m";
+my $lf = '';	# filename
+my $rf = '';
+my $ll = '';	# line number
+my $lr = '';
+my $lh = '[';	# highlight
+my $rh = ']';
+my $li = '[';	# whitespace
+my $ri = ']';
+
+# mdoc SEE ALSO section flag and xrefs
+my $seealso = 0;
+my %seealsoxrefs;
+
+# mdoc macros
+my @macros = (qw/ Dd Dt Os Sh_NAME Nm Nd Sh_SYNOPSIS Sh_DESCRIPTION /);
+my %macroval;
+
+sub INT_handler {
+	( close $fh or die "could not close filehandle:$!\n" ) if fileno($fh);
+	removetempfiles();
+	exit 0;
+}
+
+sub initialize {
+	$today = strftime("%B %e, %Y", localtime);
+	$today =~ s/  / /g;
+
+	# ANSI color codes
+	for my $i (0..@colors-1) {
+		$ansi{"dark$colors[$i]"} = "\033["   . ($i+31) . "m";
+		$ansi{"$colors[$i]"}     = "\033[1;" . ($i+31) . "m";
+	}
+
+	# use ANSI highlights
+	if ( $opt_R ) {
+		$lf = $ansi{darkyellow};	# filename
+		$rf = $reset;
+		$ll = $ansi{darkcyan};		# line number
+		$lr = $reset;
+		$lh = $ansi{darkgreen};		# highlight
+		$rh = $reset;
+		$li = $inverse;				# whitespace
+		$ri = $reset;
+	}
+
+	# SGML line length
+	$linelensgml = 70;
+	if ( defined($opt_L) && ($opt_L =~ /(\d+)/) ) {
+		$linelensgml = $1 if $1 > 0;
+	}
+
+	# -C start-end limits output to a range of lines
+	if ( $opt_C ) {
+		($startline, $stopline) = split(':|-', $opt_C);
+		die "-C option requires a line number range (start- | start-end | -end)\n" unless $startline || $stopline;
+	}
+
+	# -D equals -abefgmrsuw
+	if ( $opt_D ) {
+		$opt_a = $opt_b = $opt_e = $opt_f = $opt_g = $opt_m = $opt_r
+			   = $opt_s = $opt_u = $opt_w = 1;
+	}
+
+	if ( $opt_z ) {
+		# all non-whitespace tests
+		$opt_a = $opt_b = $opt_c = $opt_d = $opt_e = $opt_f = $opt_g
+		= $opt_m = $opt_o = $opt_r = $opt_s = $opt_u = $opt_E = 1;
+	}
+
+	if ( $opt_Z ) {
+		# all whitespace tests
+		$opt_i = $opt_l = $opt_n = $opt_t = $opt_w = $opt_S = $opt_W = 1;
+	}
+
+	if ( $opt_x ) {
+		# -x implies -m
+		$opt_m = 1;
+	}
+
+	# if no tests are chosen, do them all
+	unless ( $opt_a || $opt_b || $opt_c || $opt_d || $opt_e
+		  || $opt_f || $opt_g || $opt_i || $opt_l || $opt_m
+		  || $opt_n || $opt_o || $opt_r || $opt_s || $opt_t
+		  || $opt_u || $opt_w || $opt_x || $opt_y || $opt_E
+		  || $opt_S || $opt_W ) {
+		$opt_a = $opt_b = $opt_c = $opt_d = $opt_e
+			   = $opt_f = $opt_g = $opt_i = $opt_l = $opt_m
+			   = $opt_n = $opt_o = $opt_r = $opt_s = $opt_t
+			   = $opt_u = $opt_w = $opt_E = $opt_S = $opt_W = 1;
+		$opt_x = $opt_y = 0;
+	}
+
+	init_ignoreblocks();
+	init_spellingerrors();
+	init_badphrases();
+	init_contractions();
+	init_freebsdobs();
+	init_doc_titles();
+	init_doc_indentation();
+	init_doc_sentence();
+	init_doc_openclose();
+	init_literalblock_regex();
+	init_doc_writestyle();
+	init_doc_stragglers();
+
+	# ctrl-c handler
+	$SIG{'INT'} = 'INT_handler';
+	# do the same thing if the pipe closes
+	$SIG{'PIPE'} = 'INT_handler';
+
+	# autoflush
+	$| = 1;
+
+	# allow stdin
+	push @ARGV, "stdin" if $#ARGV < 0;
+}
+
+sub firstext {
+	my $fname = shift;
+	my $ext = '';
+	if ( basename($fname) =~ /\.(.*?)(?:\.|$)/ ) {
+		$ext = $1;
+	}
+	return $ext;
+}
+
+sub lastext {
+	my $fname = shift;
+	my $ext = '';
+	if ( basename($fname) =~ /\.([^.]*?)$/ ) {
+		$ext = $1;
+	}
+	return $ext;
+}
+
+sub baseonly {
+	my $fname = shift;
+	$fname = basename($fname);
+	$fname =~ s/\..*$//;
+	return $fname;
+}
+
+sub tmpfilename {
+	my $fname = shift;
+	my $ext = firstext($fname);
+	my $name = baseonly($fname);
+	return "$tmpdir/$prog-tmp-$$-$name.$ext";
+}
+
+sub filetype {
+	my $fname = shift;
+	# detect type from extension if possible
+	my $ext = lastext($fname);
+	if ( $ext ) {
+		print "detecting file type by extension: '$ext'\n" if $verbose;
+		for ( $ext ) {
+			if    ( /\d{1}/ ) { return "troff"   }
+			elsif ( /bz2/i  ) { return "bzip"    }
+			elsif ( /gz/i   ) { return "gzip"    }
+			elsif ( /sgml/i ) { return "sgml"    }
+			elsif ( /xml/i  ) { return "xml"     }
+			else              { return "unknown" }
+		}
+	}
+	# fall back to file(1)
+	print "detecting file type with file(1)\n" if $verbose;
+	my $out = `$file -b $fname`;
+	$out =~ /^(\S+\s+\S+)/;	# first two words
+	if ( $1 ) {
+		my $id = $1;
+		for ( $id ) {
+			if    ( /^troff/ )         { return "troff"   }
+			elsif ( /^exported SGML/ ) { return "sgml"    }
+			# some DocBook documents are detected as "Lisp/Scheme"
+			elsif ( /^Lisp\/Scheme/ )  { return "sgml"    }
+			elsif ( /^gzip/ )          { return "gzip"    }
+			elsif ( /^bzip/ )          { return "bzip"    }
+			else                       { return "unknown" }
+		}
+	}
+	return "unknown";
+}
+
+sub uncompress {
+	my ($fname, $type) = @_;
+	my $tmpfile = tmpfilename($fname);
+	print "uncompressing '$fname' to '$tmpfile'\n" if $verbose;
+	for ( $type ) {
+		if ( /gzip/ ) {
+			system("$gzcat $fname > $tmpfile") == 0
+				or die "could not create '$tmpfile':$!\n";
+		}
+		elsif ( /bzip/ ) {
+			system("$bzcat $fname > $tmpfile") == 0
+				or die "could not create '$tmpfile':$!\n";
+		}
+		else {
+			die "unknown compression type '$type'\n";
+		}
+	}
+	return $tmpfile;
+}
+
+sub writestdinfile {
+	$stdinfile = "$prog-stdin.$$";
+	open $fh, ">", $stdinfile or die "could not create '$stdinfile':$!\n";
+	print $fh <STDIN>;
+	close $fh or die "could not close '$stdinfile':$!\n";
+	return $stdinfile;
+}
+
+sub removetempfiles {
+	if ( $stdinfile && -f $stdinfile ) {
+		print "deleting stdinfile '$stdinfile'\n" if $verbose;
+		unlink $stdinfile or die "could not remove '$stdinfile':$!\n";
+	}
+	if ( $tmpfile && -f $tmpfile ) {
+		print "deleting tmpfile '$tmpfile'\n" if $verbose;
+		unlink $tmpfile   or die "could not remove '$tmpfile':$!\n";
+	}
+}
+
+sub showline {
+	my ($bname, $linenum, $color, $errordesc, $txt) = @_;
+	return if $startline && ($. < $startline);
+#	print "$lf$bname$rf:";
+#	print "$ll$linenum$lr:";
+#	print $color if $opt_R;
+#	print "$errordesc";
+#	print $reset if $opt_R;
+#	print ":$txt\n";
+	$errordesc =~ s/\>/&gt;/;
+	$errordesc =~ s/\</&lt;/;
+	print "<error line=\"$linenum\" column=\"1\" severity=\"warning\" message=\"$errordesc\" source=\"igor\"/>\n";
+}
+
+sub is_lowercase {
+	my $word = shift;
+	return $word =~ /^[a-z]{1}/;
+}
+
+sub is_uppercase {
+	my $word = shift;
+	return $word =~ /^[A-Z]{1}/;
+}
+
+sub highlight_word {
+	my ($txt, $word) = @_;
+	$txt =~ s/\Q$word\E/$lh$word$rh/g;
+	return $txt;
+}
+
+sub highlight_string {
+	my $txt = shift;
+	return "$lh$txt$rh";
+}
+
+sub expand_tabs {
+	my $txt = shift;
+	$txt =~ s/\t/        /g;
+	return $txt;
+}
+
+sub leading_space {
+	my $txt = shift;
+	my $leading;
+	$txt =~ /^(\s+)/;
+	$leading = ($1 ? $1 : '');
+	$leading = expand_tabs($leading);
+	return $leading;
+}
+
+sub splitter {
+	my $txt = shift;
+	return ($txt) unless ( $txt =~ /$ignoreblockstart|$ignoreblockend/ );
+	my @split = split /($ignoreblockstart|$ignoreblockend)/, $txt;
+	return grep { ! /^\s*$/ } @split;
+}
+
+sub init_ignoreblocks {
+	print "initializing ignoreblocks\n" if $verbose;
+	# create regex for sgml block start and end
+	my @ignoreblock_tags = qw/ literallayout screen programlisting /;
+	$ignoreblockstart = '(?:<!--|<!\[';
+	for my $tag (@ignoreblock_tags) {
+		$ignoreblockstart .= "|<$tag.*?>";
+	}
+	$ignoreblockstart .= ')';
+	$ignoreblockend = '(?:-->|\]\]>';
+	for my $tag (@ignoreblock_tags) {
+		$ignoreblockend .= "|<\/$tag>";
+	}
+	$ignoreblockend .= ')';
+}
+
+sub showwhitespace {
+	my $txt = shift;
+	$txt =~ s/\t/{tab}/g;
+	return $txt;
+}
+
+# global tests
+
+sub abbrevs {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+	return if $ignoreblock;
+	my $txtbak = $txt;;
+
+	if ( $txt =~ /(?:\W|^)c\.f\./i ) {
+		$txt =~ s/(c\.f\.)/$lh$1$rh/i;
+		showline($bname, $line, $ansi{darkmagenta}, 'use "cf."', $txt);
+	}
+
+	$txt = $txtbak;
+	if ( $txt =~ /(?:\W|^)e\.?g\.(?:[^,:]|$)/ ) {
+		$txt =~ s/(e\.?g\.)/$lh$1$rh/;
+		showline($bname, $line, $ansi{darkmagenta}, 'no comma after "e.g."', $txt);
+	}
+
+	$txt = $txtbak;
+	if ( $txt =~ /(?:\W|^)i\.?e\.(?:[^,:]|$)/ ) {
+		$txt =~ s/(i\.?e\.)/$lh$1$rh/;
+		showline($bname, $line, $ansi{darkmagenta}, 'no comma after "i.e."', $txt);
+	}
+
+	$txt = $txtbak;
+	if ( $txt =~ /(?:\W|^)a\.k\.a\./i ) {
+		$txt =~ s/(a\.k\.a\.)/$lh$1$rh/i;
+		showline($bname, $line, $ansi{darkmagenta}, 'use "aka" (AP style)', $txt);
+	}
+
+	$txt = $txtbak;
+	if ( $txt =~ /(?:\W|^)v\.?s(?:\.|\s|$)/i ) {
+		$txt =~ s/(v\.?s\.)/$lh$1$rh/i;
+		showline($bname, $line, $ansi{darkmagenta}, '"versus" abbreviated', $txt);
+	}
+}
+
+sub init_badphrases {
+	print "initializing badphrases\n" if $verbose;
+	@badphrases = ('allows to', 'become gain', 'be also', 'been also',
+				   "chroot'd", "compress'd", 'could might', 'could of',
+				   'equally as', 'for to', "ftp'd", 'get take',
+				   "gzip'd", 'it self', "mfc'ed", 'might could',
+				   "or'ing", 'that without', 'the a', 'the to',
+				   'this mean that', 'to for', 'to of', 'to performs',
+				   'would of',);
+}
+
+sub badphrases {
+	my ($bname, $line, $txt) = @_;
+	my $txtbak = $txt;
+	return if $txt =~ /^\s*$/;
+
+	for my $bad (@badphrases) {
+		$txt = $txtbak;
+		# check for a loose but fast match first
+		if ( $txt =~ /\Q$bad\E/i ) {
+			if ( $txt =~ s/\b(\Q$bad\E)\b/$lh$1$rh/i ) {
+				showline($bname, $line, $ansi{yellow}, 'bad phrase', $txt);
+			}
+		}
+
+		# detect bad phrases wrapping over two lines
+		# skip this test if the phrase was all on the previous line
+		next if ( $prevline =~ /\Q$bad\E\b/i );
+
+		$txt = "$prevline $txtbak";
+		if ( $txt =~ /\Q$bad\E\b/i ) {
+			my @right = split /\s/, $bad;
+			my @left  = ();
+			my $leftstr = '';
+			while ( @right ) {
+				push @left, shift @right;
+				$leftstr = join ' ',@left;
+				last if ( $prevline =~ /(\Q$leftstr\E)\s*$/i );
+			}
+			unless ( $leftstr =~ /\Q$bad\E/ ) {
+				showline($bname, $line - 1, $ansi{yellow}, 'bad phrase',
+					"... $lh$leftstr$rh");
+				$txt = $txtbak;
+				my $rightstr = join ' ', @right;
+				$txt =~ s/(\Q$rightstr\E)/$lh$1$rh/i;
+				showline($bname, $line, $ansi{yellow}, 'bad phrase', $txt);
+			}
+		}
+	}
+}
+
+sub init_contractions {
+	print "initializing contractions\n" if $verbose;
+	@contractions = ("aren't", "can't", "doesn't", "don't", "hasn't",
+					 "i'll", "i'm", "isn't", "it's", "i've", "let's",
+					 "shouldn't", "that's", "they'll", "you're",
+					 "you've", "we'd", "we'll", "we're", "we've",
+					 "won't", "would've");
+}
+
+sub contractions {
+	my ($bname, $line, $txt) = @_;
+	my $txtbak = $txt;
+	return if $txt =~ /^\s*$/;
+
+	for my $con (@contractions) {
+		$txt = $txtbak;
+		if ( $txt =~ /\Q$con\E/i ) {
+			if ( $txt =~ s/\b(\Q$con\E)\b/$lh$1$rh/i ) {
+				showline($bname, $line, $ansi{yellow}, 'contraction', $txt);
+			}
+		}
+	}
+}
+
+sub init_freebsdobs {
+	print "initializing FreeBSDobs\n" if $verbose;
+	@freebsdobs = qw/ cvsup /;
+}
+
+sub freebsdobsolete {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	for my $word (@freebsdobs) {
+		if ( $txt =~ s/(\s+)($word)([^.]+.*)$/$1$lh$2$lr$3/ ) {
+			showline($bname, $line, $ansi{darkgreen}, 'freebsd-obsolete', $txt);
+		}
+	}
+}
+
+sub repeatedwords {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	my $txtbak = $txt;
+	my %count = ();
+	my @words = grep(! /^\s*$/, split /\b/, $txt);
+	map { $count{$_}++ } @words;
+	my @multiples = grep { $count{$_} > 1 } keys %count;
+	#for my $word (keys %count) {
+	for my $word (@multiples) {
+		# skip special cases
+		# repeated numbers
+		next if $word =~ /\d{1}/;
+		# repeated slashes
+		next if $word eq '/';
+		# repeated rows of dashes
+		next if $word =~ /-+/;
+		# repeated rows of underscores
+		next if $word =~ /_+/;
+		# skip some mdoc commands
+		next if $word =~ /Fl|Ns|Oc|Oo/;
+		$txt = $txtbak;
+		if ( $txt =~ s/\b(\Q$word\E\s+\Q$word\E)\b/$lh$1$rh/i ) {
+			showline($bname, $line, $ansi{darkred}, 'repeated', $txt);
+		}
+	}
+	# check for repeated word from the end of the previous line
+	# to the beginning of the current line
+	# $prevline =~ m%(\w+\s+)*([^ *.#|+-]+\s*)$%;
+	$prevline =~ m%(\w+\s+)*(\S+\s*)$%;
+	my $cmd = ($1 ? $1 : '');
+	my $prevlastword = ($2 ? $2 : '');
+	# short-circuit when the previous line...
+	# had no last word
+	return unless $prevlastword;
+	# didn't repeat any of the words on the current line
+	$count{$prevlastword}++;
+	return unless $count{$prevlastword} > 1;
+	# was a groff(7) comment
+	return if $prevlastword eq '.c';
+	# was a groff(7) zero-space character for tables (\&.)
+	return if $prevlastword eq '\&.';
+	# was a single non-word character
+	return if $prevlastword =~ /^\W{1}$/;
+	# was an mdoc(7) or nroff(7) comment
+	return if $prevlastword =~ /^\W{1}\\\"/;
+	# was an mdoc command
+	return if $prevlastword =~ /\.(?:Ar|Oo|Nm|Tp)/i;
+	# when the next-to-last word was an mdoc command
+	return if $cmd =~ /Ar |Cm |Fa |Em |Ic |Ip |It |Li |Pa |Ss /i;
+	if ( $txt =~ s/^\s*(\Q$prevlastword\E)(\s+.*)$/$lh$1$rh$2/ ) {
+		showline($bname, $line - 1, $ansi{darkred}, 'repeated',
+			"... $cmd$lh$prevlastword$rh");
+		showline($bname, $line, $ansi{darkred}, 'repeated', $txt);
+	}
+}
+
+# read an external file of spelling errors
+# the misspelled word is the first sequence of \w or ' characters
+# up to a non-word character
+sub readspelling {
+	my $spname = shift;
+	print "adding spelling file '$spname'\n" if $verbose;
+	open my $sf, '<', $spname or die "cannot open '$spname':$!\n";
+	while ( <$sf> ) {
+		next if /^$/;
+		next if /^\s*#/;
+		if ( /^\s*((?:\w|\')+)\W+/ ) {
+			$misspelled_words{$1} = 1;
+		}
+	}
+	close $sf or die "could not close '$spname':$!\n";
+}
+
+# list of common spellingwords
+sub init_spellingerrors {
+	print "initializing spellingerrors\n" if $verbose;
+	for my $word (qw/ &nbps; abondan abscence acceptible acces accesed accesing accessable accomodate
+			accross achitecture achive acknowledgent adddress addesses additonally addreses addressess
+			addresss adhearance adiministration adminstrator adresses advertisment advices aggregatable
+			albel albels alot alredy alright ammount ande anf annonymous annoucement anonymus anormalous
+			anymore anyore appropiate approprate aqueue arbitary arbritrary arguements aritmetic
+			aritmetics assocation assoicated assotiations asychronous asynchonously asynchroneous
+			athentication autentication autheinticating authention authorty automaticaly automaticly
+			avaialble availabe availablity availbility availible availiblity awhile becuase begining
+			beleive belive besure boostrap boostrapping bootsrap boundries boundry brower browseable
+			buildling buile calcualted cannonical cant capabilties capabily captial caracteristics
+			catched cerificate certian certificat certifictate chaning choise choses chronologocal cince
+			cliens colision colisions comiters comming commited commiter commiters commiting commnad
+			commnads commnications communciation communciations compability comparision compatability
+			compatabilty compatiable compatibilty compatiblity comptemporary comsume comunication
+			concatanated configrable configuation confimation conjuction connecter connecters connectin
+			connet conneting connnects consistant consuption contect continously contrained controled
+			conujunction coordinatory corresponsding corrsponding coyping credentail credentails csvup
+			currenly datas deactive deafult dealocates deamon debuging decidely decompresssion decribed
+			definately degugging deicde deivce dependancy dependancys dependant dependeancy dependeant
+			dependend dependendencies dependiency desaster desasters descendents desciptors describd
+			descrption destinatino destine detec detecing detemine developement devide devinces dictaded
+			dictonary dieing differenciate differencies diffrent diffrently diffsof directorys
+			diretories diretory dismouted distiguish documenation documentatino documetation doesen
+			domainmame ect effecive efficent elipsis emporer enclousure encrypion enscrambled ensute
+			enviornment enviroment equivalen esle etherenet everytime evet exagerate examble excercize
+			excert exectable exectables exibits exisiting existance explaination explaned explans
+			explicitely exponentionally extemely exteneded extentensible extention extentions extreemly
+			extremly facilites failback feebsd firmwares forbiden formated forthermore forusers foward
+			fowarding fr frebsd freedback freind frequence fthernet fucntion fuction fulfil functuion
+			funtion furthur futher grapics guarateed guarentee guarentees hackyness hapen happend
+			hardwares hereon hexadecimals hiearchy hierachy hierarchal hierarchial higly homours hte
+			hthe identially idosyncracies immediatly implicits implmentation improvments incomming
+			indended indentical indentifiers independant independet indepth indivual informations
+			infrastcture infrasture inital initalize initalized initiliased inititialization inpunt
+			inputed instaler installaed installatio installtion intall integreated intepretation
+			interations interchangably interconverts intermal interogate interpretedt intial intruction
+			isonly issueing isystem joing kernal knowlege labes lable lables langage languge layed
+			lettesrs libary libraru linerly liniarly lised listning loally loosing lpdng mailling
+			maintainance managment manaul mangagement maximium mechanim mechanims mergeing mininum
+			minumum miror misprediced multipled multipy mutiple myst neccasary neccesary neccesery
+			neccessary necesary necessarely negociated neightbor nomally noone numberic numer occurance
+			occured occurence occurences ommit ommited ommitt ommitted onle onsult ony oprations optiion
+			optionsal ouf ouput outher overidden overlaping overriden overritten paramenter paramtere
+			paramters parenticies paritions partameters partion partions partiton partitons pathes
+			peformed pepetual pepetually perfom perfoms perfored performace performancing performend
+			periperal peripherial peripherials persisent peticular phoneix physcal physial platfrom
+			posible posseses postitions prameter preceed preceeded preceeding preceeds prefered
+			preferrable prefferred preform preperation preprend preprocesor presense presumeably previos
+			pricipal princial principes privelege priveleged privilige probabilly proccess proccesses
+			proceedure proceses progam progams programable programlistning projecte promiscuos propogate
+			protcol protcols provde provent pseuuedo puroses queueing raspberri realy reassambled
+			recieve recieved recommented redable reeated refering refulat relevent reloation reloations
+			remdial resemblence resouce respecitively responce respresentation retrive returs rewriten
+			rreplace seemless senarios sepcifies sepcify seperate seperated seperates seperating
+			seperation seperator setable seting setings settt shuting significnat simillar simultanious
+			slighly soemthing sofware soley someway spearator specifes specifig specifing specifiy
+			specifiying splitted sspares stabalization stantdard staticlly steping subet substition
+			subsytems succed succeds succesful successfull sugroup suject supprts supressed supresses
+			surpressed synchronisaton synonomous sytem sytems talkes targer teamm techical techincally
+			teh termporary thefirst therefor thie thier threated throgh throughly thru todays tpye
+			tradtional trafic transfered transfering translater translaters transmision trigonmetric
+			truely tthis typicall typicaly undeflowed undescores undesireable unecessary unecrypted
+			unfreezed unknwn unlinke unmouting unneccessary unprivilegded unresolveable unreversable
+			untill upto usally useable useage usefull usse utilites varialbe varialbes verion veryify
+			whereever wich wierd withough withouth witt wont wor wsouse yeild /) {
+		$misspelled_words{$word} = 1;
+	}
+	my @spellfiles;
+	# IGORSPELLFILES environment variable is a whitespace-separated list of files
+	push (@spellfiles, split /\s/, $ENV{'IGORSPELLFILES'}) if defined($ENV{'IGORSPELLFILES'});
+	# all files found in /usr/local/etc/igor/spelling
+	push (@spellfiles, split /\s/, `ls /usr/local/etc/igor/spelling/*`) if -d '/usr/local/etc/igor/spelling';
+	for my $spellfile (@spellfiles) {
+		readspelling($spellfile);
+	}
+}
+
+sub spellingerrors {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	my $txtbak = $txt;
+	my @words = split /\W+/, $txt;
+	for my $currentword (@words) {
+		if ( $misspelled_words{lc($currentword)} ) {
+			$txt = highlight_word($txt, $currentword);
+		}
+	}
+	if ( $txt ne $txtbak ) {
+		showline($bname, $line, $ansi{darkmagenta}, 'spelling', $txt);
+	}
+}
+
+sub whitespace {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^$/;
+
+	my $txtbak = $txt;
+	if ( $txt =~ s/^(\s+)$/$li$1$ri/ ) {
+		showline($bname, $line, $ansi{darkblue}, 'blank line with whitespace', $txt);
+	}
+	$txt = $txtbak;
+	if ( $txt =~ s/(\S+)(\s+)$/$1$li$2$ri/ ) {
+		showline($bname, $line, $ansi{darkblue}, 'trailing whitespace', $txt);
+	}
+	$txt = $txtbak;
+	if ( $txt =~ s/( +)\t+/$li$1$ri/ ) {
+		showline($bname, $line, $ansi{darkmagenta}, 'tab after space', $txt);
+	}
+}
+
+
+# global batch tests
+sub style {
+	my ($bname, $txt) = @_;
+	print "$lf$bname style check:$rf\n";
+
+	my $you = ($txt =~ s/you\b/you/gi);
+	my $your = ($txt =~ s/your/your/gi);
+	if ( $you || $your ) {
+		print "  $lh\"you\" used $you time", ($you==1 ? '':'s'), "$rh\n" if $you;
+		print "  $lh\"your\" used $your time", ($your==1 ? '':'s'), "$rh\n" if $your;
+		print "    \"You\" and \"your\" are informal and subjective.\n";
+		print "    Try to be formal and objective: \"the file\" rather than \"your file\".\n";
+	}
+
+	my $should = ($txt =~ s/should/should/gi);
+	if ( $should ) {
+		print "  $lh\"should\" used $should time", ($should==1 ? '':'s'), "$rh\n";
+		print "    Use \"should\" sparingly, it is feeble.\n";
+		print "    Try to be imperative: \"do this\" rather than \"you should do this\".\n";
+	}
+
+	my $obviously = ($txt =~ s/obviously/obviously/gi);
+	if ( $obviously ) {
+		print "  $lh\"obviously\" used $obviously time", ($obviously==1 ? '':'s'), "$rh\n";
+		print "    If it is really obvious, it does not need to be pointed out.\n";
+	}
+
+	my $needless = ($txt =~ s/needless to say/needless to say/gi);
+	if ( $needless ) {
+		print "  $lh\"needless to say\" used $needless time", ($needless==1 ? '':'s'), "$rh\n";
+		print "    If it doesn't need to be said, why say it?\n";
+	}
+
+	my $thefollowing = ($txt =~ s/the following/the following/gi);
+	if ( $thefollowing ) {
+		print "  $lh\"the following\" used $thefollowing time", ($thefollowing==1 ? '':'s'), "$rh\n";
+		print "    If something is following, the reader can see it without being told.\n";
+	}
+
+	my $followingexample = ($txt =~ s/following example/following example/gi);
+	if ( $followingexample ) {
+		print "  $lh\"following example\" used $followingexample time", ($followingexample==1 ? '':'s'), "$rh\n";
+		print "    If an example is following, the reader can see it without being told.\n";
+	}
+
+	my $simply = ($txt =~ s/simply/simply/gi);
+	my $basically = ($txt =~ s/basically/basically/gi);
+	if ( $simply || $basically ) {
+		print "  $lh\"simply\" used $simply time", ($simply==1 ? '':'s'), "$rh\n" if $simply;
+		print "    Use \"simply\" to mean \"in a simple manner\", \"just\", or \"merely\", not the\n";
+		print "    patronizing \"details omitted because they are not simple enough for you\".\n";
+		print "  $lh\"basically\" used $basically time", ($basically==1 ? '':'s'), "$rh\n" if $basically;
+		print "    Use \"basically\" to mean \"essentially\" or \"fundamentally\", not \"only the\n";
+		print "    basics are shown because anything more will be too complicated for you\".\n";
+	}
+
+	my $the = ($txt =~ s/(?:^the|\.\s+the)\b/the/gi);
+	my $sent = ($txt =~ s/([^.]+\.\s+)/$1/gi);
+	my $percent = ($sent > 0 ? int($the/$sent*100) : 0);
+	if ( $the && ($percent > 19) ) {
+		print "  $lh\"The\" used to start a sentence $the time", ($the==1 ? '':'s'), " in $sent sentence", ($sent==1 ? '':'s'), " ($percent%)$rh\n";
+		print "    Starting too many sentences with \"the\" can be repetitive\n";
+		print "    and dull to read.\n";
+	}
+
+	my $cf = ($txt =~ s/\Wcf\./cf./gi);
+	my $eg = ($txt =~ s/e\.g\./e.g./gi);
+	my $ie = ($txt =~ s/i\.e\./i.e./gi);
+	my $nb = ($txt =~ s/n\.b\./n.b./gi);
+	if ( $cf ) {
+		print "  $lh\"cf.\" used $cf time", ($cf==1 ? '':'s'), "$rh\n";
+		print "    \"Cf.\" (Latin \"confer\") means \"${lf}compare$rf\" and is mostly used in academic\n";
+		print "    and scientific writing.  Consider replacing with the more common English\n";
+		print "    words.\n";
+	}
+	if ( $eg ) {
+		print "  $lh\"e.g.\" used $eg time", ($eg==1 ? '':'s'), "$rh\n";
+		print "    \"E.g.\" (Latin \"exempli gratia\") means \"${lf}for example$rf\" and is mostly\n";
+		print "    used in academic and scientific writing.  Consider replacing with the\n";
+		print "    more common English words.  Both forms are usually followed by a\n";
+		print "    comma for a verbal pause:  \"e.g., a b c\" or \"for example, a b c\"\n";
+	}
+	if ( $ie ) {
+		print "  $lh\"i.e.\" used $ie time", ($ie==1 ? '':'s'), "$rh\n";
+		print "    \"I.e.\" (Latin \"id est\") means \"${lf}that is$rf\" and is mostly used in academic\n";
+		print "    and scientific writing.  Consider replacing with the more common\n";
+		print "    English words.  Both forms are usually followed by a comma for\n";
+		print "    a verbal pause:  \"i.e., a b c\" or \"that is, a b c\"\n";
+	}
+	if ( $nb ) {
+		print "  $lh\"n.b.\" used $nb time", ($nb==1 ? '':'s'), "$rh\n";
+		print "    \"N.b.\" (Latin \"nota bene\") means \"${lf}note$rf\" or \"${lf}take notice${rf}\" and is mostly\n";
+		print "    used in academic and scientific writing.  Consider replacing with\n";
+		print "    the more common English words.\n";
+	}
+
+	my $inorderto = ($txt =~ s/in order to/in order to/gi);
+	if ( $inorderto ) {
+		print "  $lh\"in order to\" used $inorderto time", ($inorderto==1 ? '':'s'), "$rh\n";
+		print "    Unless \"in order to\" has some special meaning here, \"to\" is simpler.\n";
+	}
+
+	my $invoke = ($txt =~ s/invoke/invoke/gi);
+	if ( $invoke ) {
+		print "  $lh\"invoke\" used $invoke time", ($invoke==1 ? '':'s'), "$rh\n";
+		print "    Unless \"invoke\" has some special meaning in context, \"run\" is simpler.\n";
+	}
+
+	# type-specific tests
+	if ( $type eq "troff" ) {
+		my $examples = ($txt =~ /\n\.\s*Sh\s+EXAMPLES/i);
+		unless ( $examples ) {
+			print "  ${lh}no \"EXAMPLES\" section found$rh\n";
+			print "    Even trivial examples can improve clarity.\n";
+			print "    Common-use examples are better yet.\n";
+		}
+	}
+}
+
+# mdoc line-by-line tests
+sub mdoc_date {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	if ( $txt =~ s/^(\.\s*Dd\s+)(.*)$/$1$lh$2$rh/ ) {
+		$docdate = $2;
+		showline($bname, $line, $ansi{darkyellow}, "date not today, $today", $txt) if $docdate ne $today;
+	}
+}
+
+sub mdoc_sentence {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	if ( $txt =~ s/^(\w{2,}.*?[^ .]{2,}\.\s+)(A |I |\w{2,})(.*)$/$1$lh$2$3$rh/ ) {
+		showline($bname, $line, $ansi{darkcyan}, 'sentence not on new line', $txt);
+	}
+}
+
+sub init_mdoc_uniqxrefs {
+	print "initializing mdoc_uniqxrefs\n" if $verbose;
+	%seealsoxrefs = ();
+}
+
+sub mdoc_uniqxrefs {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	# set a flag to indicate when a .Sh SEE ALSO section is found
+	if ( $txt =~ /^\.Sh\s+(.*)/i ) {
+		$seealso = ( $1 =~ /SEE ALSO/i );
+		print "mdoc_uniqxrefs: SEE ALSO section found\n" if $verbose;
+		return;
+	}
+
+	# only check xrefs for repeats inside a SEE ALSO section
+	if ( $seealso ) {
+		# if inside a SEE ALSO section, stop looking for duplicates
+		# after non-.Xr macros.  These would probably be text sections
+		# talking about the external references, not included in the list.
+		if ( ($txt =~ /^\./) && ($txt !~ /^\.Xr/i) ) {
+			$seealso = 0;
+			return;
+		}
+
+		# allow both valid mdoc formats (.Xr umount 8 ,)
+		# and bad ones (.Xr xorg.conf(5),)
+		if ( $txt =~ /\.Xr\s+(.*)(?:\s|\()(\d{1}\w?)/i ) {
+			my $xrefname = $1;
+			my $xrefsect = $2;
+			if ( $seealsoxrefs{"$xrefname-$xrefsect"} ) {
+				$txt =~ s/($xrefname.*$xrefsect)/$lh$1$rh/g;
+				showline($bname, $line, $ansi{yellow}, "duplicate SEE ALSO reference", $txt);
+			} else {
+				$seealsoxrefs{"$xrefname-$xrefsect"} = 1;
+			}
+		}
+	}
+}
+
+sub showmacvals {
+	my ($lastmacro, $bname, $line) = @_;
+	for my $macro (@macros) {
+		last if $macro eq $lastmacro;
+		unless ( $macroval{$macro} ) {
+			showline($bname, $line, $ansi{red}, ".$lastmacro used here", "but .$macro has not been defined");
+		}
+	}
+}
+
+sub init_mdoc_structure {
+	print "initializing mdoc_structure\n" if $verbose;
+	for my $macro (@macros) {
+		$macro =~ tr/_/ /;
+		$macroval{$macro} = '';
+	}
+}
+
+sub mdoc_structure {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	# skip if the line starts with an mdoc macro
+	# technically, whitespace is allowed before macros
+	return unless $txt =~ /^\s*\./;
+
+	# check for required minimum macros
+	my $parm;
+	for my $macro (@macros) {
+		$parm = '';
+		$macro =~ tr/_/ /;
+		next if $macroval{$macro};
+		if ( $txt =~ /^\.\s*\Q$macro\E\s*(.*)/i ) {
+			my $parm = $1;
+			# provide a blank parameter for macros with optional parameters
+			$parm = ' ' if ($macro =~ /^Os|Sh NAME|Sh SYNOPSIS|Sh DESCRIPTION/) && (!$parm);
+			$macroval{$macro} = $parm;
+			showmacvals($macro, $bname, $line);
+			last;
+		}
+	}
+
+	# check external refs (.Xr)
+	# suggested by Glen Barber
+	return unless $txt =~ /^.Xr/;
+
+	# characters to treat as whitespace in an Xr macro
+	my $wspace = '[ (),.:]';
+	# character class for section numbers
+	# an initial number possibly followed by a letter
+	my $sect = '\d{1}[A-Za-z]?';
+
+	my $xname = '';
+	$xname = $1 if $txt =~ /^.Xr$wspace+(\S+)/;
+	my $xsection = '';
+	$xsection = $1 if $txt =~ /^.Xr$wspace+\S+$wspace+($sect)/;
+
+	if ( ! $xname ) {
+		showline($bname, $line, $ansi{yellow}, 'xref name missing', $txt);
+		return;
+	}
+
+	if ( $xname =~ /\($sect\)/ ) {
+		$txt =~ s/($xname)/$lh$1$rh/;
+		showline($bname, $line, $ansi{yellow}, 'section number in name', $txt);
+		return;
+	}
+
+	if ( $xsection && ($xsection gt "9") ) {
+		$txt =~ s/^(.Xr$wspace+\S+$wspace+)($sect)/$1$lh$2$rh/;
+		showline($bname, $line, $ansi{yellow}, 'section higher than 9', $txt);
+		# no point in checking for sections higher than 9
+		return;
+	}
+
+	if ( $opt_x ) {
+		system("$man -w $xsection $xname >/dev/null 2>&1");
+		if ( $? ) {
+			if ( $xsection ) {
+				$txt =~ s/^(.Xr$wspace+)(\S+$wspace+$sect)/$1$lh$2$rh/;
+			} else {
+				$txt =~ s/^(.Xr$wspace+)(\S+)/$1$lh$2$rh/;
+			}
+			showline($bname, $line, $ansi{darkmagenta}, 'external man page not found', $txt);
+			# not found, no point in checking if it's this one
+			return;
+		}
+	}
+
+	# is this external reference referring to itself?
+	# skip if the .Nm macro has no value
+	return if $macroval{'Nm'} ne $xname;
+	my $currsection = '';
+	if ( $macroval{'Dt'} =~ /^\S+\s+($sect)/ ) {
+		$currsection = $1;
+	}
+	return if $xsection ne $currsection;
+	if ( $xsection && $currsection ) {
+			$txt =~ s/^(.Xr$wspace+)(\S+$wspace+$sect)/$1$lh$2$rh/;
+		} else {
+			$txt =~ s/^(.Xr$wspace+)(\S+)/$1$lh$2$rh/;
+		}
+	showline($bname, $line, $ansi{darkmagenta}, 'xref refers to *this* page (use .Nm)', $txt);
+}
+
+
+# DocBook line-by-line tests
+
+sub init_doc_titles {
+	print "initializing doc_titles\n" if $verbose;
+	# build regex of words that should be lowercase in titles
+	my @lc_words = qw/ a an and at by down for from in into like near
+					   nor of off on onto or over past the to upon with /;
+	$lc_regex = '(?:' . join('|', @lc_words) . ')';
+	my @uc_words = qw/ about are how log new not set tag use
+					   one two three four five six seven eight nine /;
+	$uc_regex = '(?:' . join('|', @uc_words) . ')';
+
+	# build regex for ignoring DocBook tagged words in titles
+	# like <command>ls</command>
+	my @ignoretags = qw/ acronym application command filename function
+						 hostid literal makevar replaceable sgmltag /;
+	for my $tag (@ignoretags) {
+		$tag = "<$tag.*?>.*?<\/$tag>";
+	}
+	$ignoreregex = '<anchor.*?>|' . join('|', @ignoretags)
+}
+
+sub doc_titles {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	my $txtbak = $txt;
+
+	return if $ignoreblock;
+	$titleblock = 1 if $txt =~ /<title/;
+	return unless $titleblock;
+
+	my @words;
+
+	# take the text from between title tags, or the
+	# whole line if a title tag is not present
+	# split the result into an array of words, keeping
+	# ignorable DocBook tags wrapped around text
+	if ( ($txt =~ /<title.*?>(.*?)(?:<\/title>|$)/)
+		 || ($txt =~ /(.*)(?:<\/title>)/) ) {
+		# @words = grep (! /^\s*$/, split /($ignoreregex|\s+)/, $1);
+		@words = split /($ignoreregex|\s+)/, $1;
+	} else {
+		# @words = grep (! /^\s*$/, split /($ignoreregex|\s+)/, $txt);
+		@words = split /($ignoreregex|\s+)/, $txt;
+	}
+
+	# filter out single tags like <anchor id="something">
+	# WB: removing these tags breaks the comparison at the end
+	#@words = grep { ! /<anchor.*?>/ } @words;
+
+	# use AP style: capitalize words longer than three letters; see also
+	# http://www.freebsd.org/cgi/cvsweb.cgi/doc/en_US.ISO8859-1/books/handbook/linuxemu/chapter.sgml#rev1.48
+	WORD: for my $i (0..$#words) {
+		my $word = $words[$i];
+
+		next WORD if $word =~ /$ignoreregex/;
+
+		# special case: skip the contents of some unfinished tags
+		# <title>Configuring <acronym role="Domain Name
+		#   System">DNS</acronym></title>
+		next WORD if $word =~ /(?:role)=/;
+
+		# special case: allow single lowercase "s" for plurals
+		next WORD if $word eq 's';
+
+		# special case words that should not be capitalized
+		next WORD if $word =~ /^(?:amd64|i386|x86)$/;
+
+		# first word should be capitalized
+		if ( ($txt =~ /<title/) && ($i == 0) ) {
+			if ( is_lowercase($word) ) {
+				$words[$i] = highlight_string($word);
+			}
+			# first word is special, skip other tests
+			next WORD;
+		}
+
+		# last word should be capitalized
+		if ( ($txt =~ /<\/title/) && ($i == $#words) ) {
+			if ( is_lowercase($word) ) {
+				$words[$i] = highlight_string($word);
+			}
+			# last word is special, skip other tests
+			last WORD;
+		}
+
+		# words that should be lower case
+		if ( is_uppercase($word) ) {
+			if ( $word =~ /^$lc_regex$/i ) {
+				$words[$i] = highlight_string($word);
+				next WORD;
+			}
+		}
+
+		# words that should be upper case
+		if ( is_lowercase($word) ) {
+			if ( $word !~ /^$lc_regex$/i ) {
+				if ( (length($word) > 3) ) {
+					$words[$i] = highlight_string($word);
+					next WORD;
+				}
+			}
+			if ( $word =~ /^$uc_regex$/i ) {
+				$words[$i] = highlight_string($word);
+				next WORD;
+			}
+		}
+	}
+
+	# reconstruct the now-capitalized title
+	$txt = '';
+	$txt = $1 if $txtbak =~ /^(.*<title.*?>)/;
+	$txt .= join('', @words);
+	$txt .= $1 if $txtbak =~ /(<\/title.*?>)/;
+
+	if ( $txt ne $txtbak ) {
+		print "title capitalization:\n   original='$txtbak'\nhighlighted='$txt'\n" if $verbose;
+		showline($bname, $line, $ansi{blue}, 'capitalization', $txt);
+	}
+
+	$titleblock = 0 if $txt =~ /<\/title>/;
+}
+
+sub init_doc_indentation {
+	print "initializing doc_indentation\n" if $verbose;
+	# build regex for detecting DocBook tags that begin or
+	# end an indented section
+	my @indent_tags = qw/ abstract answer appendix article articleinfo author
+						  authorgroup biblioentry bibliography biblioset
+						  blockquote book bookinfo callout calloutlist
+						  chapter chapterinfo colophon caution contrib entry
+						  example figure formalpara funcdef funcsynopsis
+						  funcprototype glossary glossdef glossdiv
+						  glossentry glossterm important imageobject
+						  imageobjectco info informaltable informalexample
+						  itemizedlist legalnotice listitem mediaobject
+						  mediaobjectco note orderedlist para paramdef
+						  partintro personname preface procedure qandadiv
+						  qandaentry qandaset question row screenco
+						  sect1 sect2 sect3 sect4 sect5 section seglistitem
+						  segmentedlist sidebar step surname table tbody
+						  tgroup thead tip title variablelist
+						  varlistentry warning /;
+	# add VuXML tags
+	@indent_tags = (@indent_tags, qw/ affects body cvename dates
+						description discovery name p range references
+						topic ul vuln vuxml /);
+	@indent_tags = (sort {length($b) <=> length($a)} @indent_tags);
+	print "indentation tags: @indent_tags\n" if $verbose;
+	$indent_regex = '(?:' . join('|', @indent_tags) . ')';
+	print "indentation regex: $indent_regex\n" if $verbose;
+	# build regex for inline tags like
+	# <filename>blah</filename>
+	my @inline_tags = qw/ acronym application citetitle command computeroutput
+						  devicename emphasis envar errorname filename
+						  firstterm footnote function guimenu guimenuitem
+						  hostid imagedata indexterm keycap keycombo link
+						  literal makevar option optional package parameter
+						  primary quote remark replaceable secondary see seg
+						  sgmltag simpara structname systemitem term ulink
+						  uri varname /;
+	# add VuXML tags
+	@inline_tags = (@inline_tags, qw/ ge gt le lt url /);
+	@inline_tags = (sort {length($b) <=> length($a)} @inline_tags);
+	print "inline tags: @inline_tags\n" if $verbose;
+	$inline_regex = '(?:' . join('|', @inline_tags) . ')';
+	print "inline regex: $inline_regex\n" if $verbose;
+}
+
+sub doc_indentation {
+	my ($bname, $line, $currline) = @_;
+	my ($init_prev_indent, $init_curr_indent);
+	return if $currline =~ /^\s*$/;
+
+	# indents are not significant inside ignorable SGML blocks.
+	return if $ignoreblock;
+
+	return if $currline =~ /^\s*<!--.*-->\s*$/;
+
+	# \b is needed here to prevent <parameter> being detected as <para>
+	return unless $prevnonblank =~ /<\/*$indent_regex\b.*?>/;
+
+	my $prev_indent = length(leading_space($prevnonblank));
+	my $curr_indent = length(leading_space($currline));
+	if ( $verbose ) {
+		# save initial values for later verbose reporting
+		$init_prev_indent = $prev_indent;
+		$init_curr_indent = $curr_indent;
+	}
+
+	# indent once for open tag on previous line
+	$prev_indent += 2 if $prevnonblank =~ /<$indent_regex\b/;
+
+	# allow for inline tag indenting, like
+	# <link
+	#   url=
+	# or
+	# <makevar>xyz
+	#   abc</makevar>
+	my $count = 0;
+	$count += ($prevnonblank =~ s/(<$inline_regex)\b/$1/g);
+	$count -= ($prevnonblank =~ s/(<\/$inline_regex)\b/$1/g);
+	$prev_indent += (2 * $count);
+
+	# if previous line ends in an open xref, indent
+	$prev_indent += 2 if ($prevnonblank =~ /<xref\s*$/);
+
+	# <xref> has no close tag, but uses "linkend=" the same as <link>
+	# which *does* have a close tag... so if there's a linkend= on
+	# previous line but no </ulink> or </link> on either previous
+	# or current lines, assume it's an xref and outdent
+	my $broken_regex = '(?:(?:linkend|url)=)';
+	if ( $prevnonblank =~ /^\s*$broken_regex/ ) {
+		if ($prevnonblank !~ /<\/(?:link|ulink)/) {
+			if ($currline !~ /<\/(?:link|ulink)/) {
+				$prev_indent -= 2;
+			}
+		}
+	}
+
+	# outdent for close tag at end of previous line
+	$prev_indent -= 2 if ($prevnonblank =~ /\S+.*<\/$indent_regex>\s*$/);
+
+	# outdent for close tag at the start of this line
+	$prev_indent -= 2 if ($currline =~ /^\s*<\/$indent_regex/);
+
+	# outdent after footnote
+	$prev_indent -=2 if $prevnonblank =~ /<\/para><\/footnote>/;
+
+	# singleton tags like <entry/> are really just an empty
+	# open/close tag, <entry></entry>, allow for them
+	$prev_indent -=2 if $prevnonblank =~ /\/>$/;
+
+	# close tags after long sections of nonindented blocks,
+	# like the end of a programlisting, cannot be correctly
+	# checked for indentation in this hacky way, so ignore them
+	if ( ($prevnonblank =~ /$ignoreblockstart|$ignoreblockend/)
+		|| ($currline =~ /$ignoreblockend/) ) {
+		$curr_indent = $prev_indent;
+	}
+
+	if ( $curr_indent != $prev_indent ) {
+		if ( $verbose ) {
+			print "doc_indentation:\n";
+			my $vprev = showwhitespace($prevnonblank);
+			my $vcurr = showwhitespace($currline);
+			print "previous nonblank line: '$vprev\'\n";
+			print "          current line: '$vcurr\'\n";
+			print "\t\t\t\tinitial\tfinal\n";
+			print "previous nonblank indent:\t$init_prev_indent\t$prev_indent\n";
+			print "          current indent:\t$init_curr_indent\t$curr_indent\n";
+		}
+		my $out = $origline;
+		$out =~ s/(^\s+)/$li$1$ri/;
+		showline($bname, $line, $ansi{darkred}, 'bad tag indent', $out);
+	}
+}
+
+# split and return leading space and content
+sub splitleading {
+	my $txt = shift;
+	my $inspace = '';
+	my $content = $txt;
+	if ( $txt =~ /^(\s*)(.*)/ ) {
+		$inspace = $1 if $1;
+		$content = $2 if $2;
+	}
+	return ($inspace, $content);
+}
+
+sub doc_longlines {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+	return if $ignoreblock;
+	# if line is longer than $linelensgml (normally 70) chars
+	# and the part after the indent has spaces
+	# this should be smarter, like seeing if the part before the space
+	# will benefit from wrapping
+
+	# ignore long lines with these tags
+	return if $txt =~ /<(?:!DOCTYPE|!ENTITY|pubdate|releaseinfo)/;
+
+	$txt = expand_tabs($txt);
+
+	if ( length($txt) > $linelensgml ) {
+		my ($inspace, $content) = splitleading($txt);
+		my $currline = substr($content, 0, $linelensgml - length($inspace));
+		my $nextline = substr($content, length($currline));
+		if ( $currline =~ / / ) {
+			$currline =~ s/^(.*)? (.*)$/$1$li $ri$2/;
+			showline($bname, $line, $ansi{green}, 'wrap long line', "$inspace$currline$nextline");
+		} elsif ( $nextline =~ s/ /$li $ri/ ) {
+			showline($bname, $line, $ansi{green}, 'wrap long line', "$inspace$currline$nextline");
+		}
+	}
+}
+
+sub init_doc_sentence {
+	print "initializing doc_sentence\n" if $verbose;
+	# end of sentence characters: literal dot, question mark, exclamation point
+	$eos_regex = '\.|\?\!';
+}
+
+sub doc_sentence {
+	my ($bname, $line, $txt) = @_;
+
+	return if $txt =~ /^\s*$/;
+	return if $ignoreblock;
+
+	# skip if there is no end-of-sentence character
+	return unless $txt =~ /(?:$eos_regex)/;
+
+	my $errcount = 0;
+	my ($inspace, $content) = splitleading($txt);
+	my @sentences = grep (! /^$/, split /((?:.*?(?:$eos_regex)+\s+)|(?:<.*?>))/, $content);
+
+	for my $s (@sentences) {
+		# skip unless it has a one-space possible sentence start
+		next unless $s =~ /\. $/;
+
+		# SGML markup, like "<emphasis>bold</emphasis>."
+		#next if $s =~ />\. $/;
+
+		# single dots, like from "find . -name '*.sgml'"
+		next if $s =~ / \. $/;
+
+		# initials
+		next if $s =~ /[A-Z]{1}\. $/;
+
+		# common abbreviations
+		next if $s =~ /(?:Ave|Dr|Ed|etc|Inc|Jr|Mass|Pub|Sp|St|Str|str|o\.o)\. $/;
+
+		# ignore misuse of cf., e.g., i.e., and v.s., they are not
+		# end of sentence errors
+		next if $s =~ /(?:cf|e(?:\.)*g|i\.e|v\.s)\. $/i;
+
+		# months
+		next if $s =~ /(?:Jan|Feb|Mar|Apr|May|Jul|Aug|Sep|Oct|Nov|Dec)\. $/;
+
+		# numbers, like "... and 1997."
+		next if $s =~ /\d+\. $/;
+
+		# ellipsis
+		next if $s =~ /\.\.\. $/;
+
+		# it must be a single-space sentence start
+		$s =~ s/ $/$li $ri/;
+		$errcount++;
+	}
+
+	if ( $errcount ) {
+		# reassemble the now-highlighted string
+		$txt = $inspace . join('', @sentences);
+		showline($bname, $line, $ansi{darkblue}, 'use two spaces at sentence start', $txt);
+	}
+}
+
+sub init_doc_openclose {
+	print "initializing doc_openclose\n" if $verbose;
+	@openclose_tags = qw/ callout entry filename footnote li listitem literal p para row step /;
+	for my $tag (@openclose_tags) {
+		$opentag{$tag} = 0;
+	}
+	$openclose_regex = join('|', @openclose_tags);
+	my @list_tags = qw/ itemizedlist orderedlist variablelist /;
+	$list_regex = join('|', @list_tags);
+	my @parawrap_tags = qw/ footnote listitem /;
+	$parawrap_regex = join('|', @parawrap_tags);
+}
+
+sub doc_openclose {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+	return if $ignoreblock;
+	return unless $txt =~ /</;
+
+	my $errcount = 0;
+	my ($inspace, $content) = splitleading($txt);
+	my @chunks = split(/(<.*?(?:>|$))/, $content);
+	@chunks = grep (! /^\s*$/, @chunks);
+
+	for my $chunk (@chunks) {
+		next unless $chunk =~ /</;
+
+		for my $tag (@openclose_tags) {
+			next unless $chunk =~ /(?:$openclose_regex)/;
+			if ( $chunk =~ /$tag/ ) {
+				# check for open without close
+				if ( $opentag{$tag} && $chunk =~ /<$tag\b/ ) {
+					$chunk =~ s/(<$tag\b)/$lh$1$rh/;
+					showline($bname, $line, $ansi{red}, "open <$tag> without closing", $inspace . join('', @chunks));
+				}
+
+				# check for close without open
+				if ( ! $opentag{$tag} && $chunk =~ /<\/$tag>/ ) {
+					$chunk =~ s/(<\/$tag\W)/$lh$1$rh/;
+					showline($bname, $line, $ansi{red}, "close </$tag> without opening", $inspace . join('', @chunks));
+				}
+
+				# evaluate closes
+				$opentag{$tag} = 0 if $chunk =~ /<\/$tag>/;
+				# evaluate opens
+				$opentag{$tag} = 1 if $chunk =~ /<$tag\b/;
+			}
+		}
+
+		# special-case closes
+		# <para> can be inside footnotes or lists
+		$opentag{'para'} = 0 if $chunk =~ /<(?:$parawrap_regex)\b/;
+		$opentag{'para'} = 0 if $chunk =~ /<\/(?:$list_regex)>/;
+
+		# list tags like <itemizedlist> start a new list
+		# so 'listitem' is no longer open
+		$opentag{'listitem'} = 0 if $chunk =~ /<(?:$list_regex)\b/;
+
+		# procedures can be nested, so <procedure> closes <step>
+		$opentag{'step'} = 0 if $chunk =~ /<procedure\b/;
+
+
+		# special-case opens
+		$opentag{'para'} = 1 if $chunk =~ /<\/(?:$parawrap_regex)>/;
+		$opentag{'para'} = 1 if $chunk =~ /<(?:$list_regex)\b/;
+
+		# list tags like </itemizedlist> end a list
+		# so 'listitem' is open again
+		$opentag{'listitem'} = 1 if $chunk =~ /<\/(?:$list_regex)>/;
+
+		# procedures can be nested, so </procedure> opens <step>
+		$opentag{'step'} = 1 if $chunk =~ /<\/procedure\b/;
+	}
+}
+
+sub init_literalblock_regex {
+	print "initializing literalblock_regex\n" if $verbose;
+	# used by multiple tests
+	$literalblock_regex = 'literallayout|programlisting|screen';
+}
+
+sub doc_tagstyle_whitespace {
+	my ($bname, $line, $currline) = @_;
+	return if $ignoreblock;
+
+	my $currlinebak = $currline;
+
+	# <title>
+	if ( $currline =~ s/^(\s*\S+.*?)(<title)/$1$lh$2$rh/ ) {
+		showline($bname, $line, $ansi{darkcyan}, 'put <title> on new line', $currline);
+		$currline = $currlinebak;
+	}
+
+	# <para>
+	if ( $currline =~ s/(<\/para>)([^< ]+)$/$1$lh$2$rh/ ) {
+		showline($bname, $line, $ansi{red}, 'character data is not allowed here', $currline);
+		$currline = $currlinebak;
+	}
+
+	# (programlisting>
+	if ( $currline =~ /<programlisting/ ) {
+		# <programlisting> should not be used as an inline tag
+		if ( $currline =~ s/(\S+\s*<programlisting.*?>)/$lh$1$rh/ ) {
+			showline($bname, $line, $ansi{red}, 'do not use <programlisting> inline in other elements', $currline);
+			$currline = $currlinebak;
+		} elsif ( ($currline =~ /\s*<programlisting/)
+			&& ($prevnonblank !~ /<\/(?:entry|formalpara|indexterm|note|para|programlisting|screen|title)>\s*$/) ) {
+			# <programlisting> allowed inside these elements
+			return if $prevnonblank =~ /<(?:example|informalexample)>/;
+			$currline =~ s/(<programlisting.*?>)/$lh$1$rh/;
+			showline($bname, $line, $ansi{red}, 'do not use <programlisting> inside other elements', $currline);
+			$currline = $currlinebak;
+		}
+	}
+
+	# elements that should be preceded by a blank line
+	if ( $prevline =~ /\S+/ ) {
+		# an open tag like <informalexample> is okay, otherwise
+		# there should be a blank line before these tags
+		if ( ($prevline !~ /<.*?>\s*$/) && ($currline =~ s/(<(?:$literalblock_regex).*?(?:>|$))/$lh$1$rh/) ) {
+			showline($bname, $line, $ansi{darkcyan}, "precede $1 with a blank line", $currline);
+			$currline = $currlinebak;
+		}
+	}
+
+	# elements that should be followed by a blank line
+	if ( $currline =~ /\S+/ ) {
+		# a close tag like </note> is okay, otherwise there
+		# should be a blank line after these tags
+		# unless they are followed by another close tag on the same line
+		# example: </literallayout></entry>
+		# if ( ($currline !~ /^\s*<\//) && ($prevline =~ /(<\/(?:$literalblock_regex|row|step|title)>)/) ) {
+		if ( ($currline !~ /^\s*<\//) && ($prevline =~ /(<\/(?:$literalblock_regex|row|step|title)>)/) && ($prevline !~ /<\/entry>$/) ) {
+			showline($bname, $line, $ansi{darkcyan}, "add blank line after $1 on previous line", "$lh$currline$rh");
+		}
+	}
+}
+
+sub init_doc_writestyle {
+	print "initializing doc_writestyle\n" if $verbose;
+	$redundantword_regex = 'command|filename|keycap|option';
+	$redundanttagword_regex = '(<\/(?:command> command|filename> file|keycap> key|option> option))\b';
+}
+
+sub doc_writestyle {
+	my ($bname, $line, $currline) = @_;
+	return if $ignoreblock;
+
+	my $currlinebak = $currline;
+
+	# test for redundant markup and words starting on the previous line
+	if ( $prevline =~ /(<\/(?:$redundantword_regex)>*\s*$)/ ) {
+		my $prevend = $1;
+		for my $word (split('|', $redundantword_regex)) {
+			next unless $prevend =~ /$word/;
+			next unless $currline =~ /^\s*>*\s*(\w+)\s*(?:\W+|$)/;
+			my $firstword = $1;
+			if ( "$prevend $firstword" =~ /$redundanttagword_regex/ ) {
+				$currline =~ s/^(\s*)($firstword)\b/$1$lh$2$rh/;
+				showline($bname, $line-1, $ansi{darkmagenta}, 'redundant markup and word', "... $lh$prevend$rh");
+				showline($bname, $line,   $ansi{darkmagenta}, 'redundant markup and word', $currline);
+				$currline = $currlinebak;
+				last;
+			}
+		}
+	}
+
+	# test for redundant markup and words on the current line
+	if ( $currline =~ /$redundantword_regex/ ) {
+		if ( $currline =~ s/$redundanttagword_regex/$lh$1$rh/ ) {
+			showline($bname, $line, $ansi{darkmagenta}, 'redundant markup and word', $currline);
+			$currline = $currlinebak;
+		}
+	}
+}
+
+sub init_doc_stragglers {
+	print "initializing doc_stragglers\n" if $verbose;
+	@straggler_tags = qw/ command entry literal para title /;
+}
+
+sub doc_stragglers {
+	my ($bname, $line, $txt) = @_;
+	return if $txt =~ /^\s*$/;
+
+	# check for literal start tags without listing on the same line
+	my $tag;
+	if ( $txt =~ />\s*$/ ) {
+		if ( $txt =~ /<($literalblock_regex)[^<]?>$/ ) {
+			$tag = $1;
+			$txt =~ s/(<$tag[^<]?>)$/$lh$1$rh/;
+			showline($bname, $line, $ansi{yellow}, "put <$tag> listing on same line", $txt);
+			return;
+		} elsif ( $txt =~ /^\s*<\/($literalblock_regex)[^<]?>/ ) {
+			$tag = $1;
+			$txt =~ s/(<\/$tag[^<]?>)$/$lh$1$rh/;
+			showline($bname, $line, $ansi{yellow}, "straggling </$tag>", $txt);
+			return;
+		}
+	}
+
+	# the following tests are only for close tags at the start of a line
+	return unless $txt =~ /^\s*<\//;
+
+	return if $ignoreblock;
+
+	# stragglers can't be detected when coming out of an ignore block
+	return if ( $prevline =~ /$ignoreblockstart|$ignoreblockend/ );
+
+	# more special-case hackery to handle
+	#   </table>
+	# </para>
+	if ( ($prevline =~ /<\/table>\s*$/)
+		&& ($txt =~ /^\s*<\/para>\s*$/) ) {
+		return;
+	}
+
+	for my $tag (@straggler_tags) {
+		if ( $txt =~ /^\s*(<\/$tag>)\s*$/ ) {
+			$txt = highlight_word($txt, $1);
+			showline($bname, $line, $ansi{yellow}, "straggling </$tag>", $txt);
+		}
+	}
+}
+
+sub doc_whitespace {
+	my ($bname, $line, $txt) = @_;
+	my $txtbak = $txt;
+
+	# indents and tabs/spaces are not significant inside
+	# ignorable SGML blocks
+	return if $ignoreblock;
+
+	# multiples of eight spaces at the start a line
+	# (after zero or more tabs) should be a tab
+	if ( $txt =~ s/^(\t* {8})+/$li$1$ri/g ) {
+		showline($bname, $line, $ansi{darkmagenta}, 'use tabs instead of spaces', $txt);
+	}
+
+	# tabs hidden in paragraphs is also bad
+	$txt = $txtbak;
+	if ( $txt =~ s/^(\s*\S+)(.*)(\t)/$1$2$li$3$ri/ ) {
+		showline($bname, $line, $ansi{darkmagenta}, 'tab in content', $txt);
+	}
+
+	# if coming out of an ignoreblock, odd spaces are
+	# an artifact of splitting the line and can't be checked
+	return if ( $prevline =~ /$ignoreblockstart|$ignoreblockend/ );
+
+	# one or more occurrences of single tabs or double spaces,
+	# followed by a single space, is a bad indent
+	# if ( $txt =~ s/^((?:(?:  )+|(?:\t+))* )\b/$li$1$ri/ ) {
+
+	# but simpler just to expand tabs to 8 spaces
+	# and check for an odd number of spaces
+	$txt = $txtbak;
+	$txt = expand_tabs($txt);
+	if ( $txt =~ s/^((?:  )* )\b/$li$1$ri/ ) {
+		showline($bname, $line, $ansi{darkred}, 'bad indent', $txt);
+	}
+}
+
+
+# DocBook batch tests
+
+
+
+# remember previous line for comparison
+sub saveprevline {
+	my $pline = shift;
+	$prevline = $pline;
+	if ( $pline =~ /\S+/ ) {
+		# treat comments as blank lines
+		return if $pline =~ /\s*<!--/;
+		return if $pline =~ /-->\s*$/;
+		$prevnonblank = $pline;
+	}
+}
+
+
+initialize();
+
+
+# main loop
+foreach my $fname (@ARGV) {
+	if ( $fname ne 'stdin' ) {
+		next if -d $fname;
+		unless ( -f $fname ) {
+			print "$fname: not found\n";
+			next;
+		}
+		next unless -r $fname;
+	}
+
+	#print "$fname:\n" if $#ARGV > 0;
+	print "<file name=\"$fname\">" if $#ARGV > 0;
+	$fname = writestdinfile() if $fname eq "stdin";
+
+	$bname = basename($fname);
+	$tmpfile = '';
+	$type = filetype($fname);
+
+	if ( $type =~ /gzip|bzip/ ) {
+		$tmpfile = uncompress($fname, $type);
+		$type = filetype($tmpfile);
+	}
+
+	print "detected file type:$type\n" if $verbose;
+
+	open $fh, '<', ($tmpfile ? $tmpfile : $fname) or die "cannot open '$tmpfile':$!\n";
+
+	# reset for each new document
+	init_mdoc_uniqxrefs() if $opt_g;	# mdoc see also xrefs
+	init_mdoc_structure() if $opt_m;	# mdoc tag presence
+	$ignoreblock = 0;		# ignore SGML block
+	my $saveindent = '';	# SGML indent level
+
+	# line-by-line tests
+	while (<$fh>) {
+		last if $stopline && ($. > $stopline);
+
+		chomp;
+
+		# global tests
+		abbrevs($bname, $., $_)         if $opt_a;
+		badphrases($bname, $., $_)      if $opt_b;
+		contractions($bname, $., $_)    if $opt_u;
+		freebsdobsolete($bname, $., $_) if $opt_f;
+		repeatedwords($bname, $., $_)   if $opt_r;
+		spellingerrors($bname, $., $_)  if $opt_s;
+		whitespace($bname, $., $_)      if $opt_w;
+
+		# mdoc line tests
+		if ( $type eq "troff" ) {
+			next if /^\.\\\"/;	# ignore comments for these tests
+
+			mdoc_date($bname, $., $_)      if $opt_d;
+			mdoc_sentence($bname, $., $_)  if $opt_e;
+			mdoc_uniqxrefs($bname, $., $_) if $opt_g;
+			mdoc_structure($bname, $., $_) if $opt_m;
+		}
+
+		# DocBook line tests
+		if ( $type =~ /sgml|xml/ ) {
+			$origline = $_;
+			doc_stragglers($bname, $., $_)          if $opt_S;
+			doc_tagstyle_whitespace($bname, $., $_) if $opt_t;
+			for my $segment (splitter($_)) {
+				if ( $segment =~ /($ignoreblockstart)/ ) {
+					# when entering an ignore block, test the full
+					# line for indentation unless it is a comment
+					unless ( $origline =~ /^\s*<!--/ ) {
+						doc_indentation($bname, $., $origline) if $opt_i;
+						# test just the indent for whitespace
+						my ($origindent, undef) = splitleading($origline);
+						doc_whitespace($bname, $., $origindent) if $opt_W;
+						$saveindent = leading_space($origline);
+						# save the same state information as the main loop would
+						saveprevline($saveindent . $1);
+						# test just the leading whitespace
+					}
+					$ignoreblock = 1;
+					next;
+				} elsif ( $segment =~ /($ignoreblockend)/ ) {
+					# restore the indent level at the end of an ignore block
+					$ignoreblock = 0;
+					$prevline = substr($saveindent,0,length($saveindent)-2) . $1;
+					next;
+				}
+				doc_titles($bname, $., $segment)      if $opt_c;
+				doc_indentation($bname, $., $segment) if $opt_i;
+				doc_longlines($bname, $., $segment)   if $opt_l;
+				doc_sentence($bname, $., $segment)    if $opt_n;
+				doc_openclose($bname, $., $segment)   if $opt_o;
+				doc_writestyle($bname, $., $segment)  if $opt_E;
+				doc_whitespace($bname, $., $segment)  if $opt_W;
+			}
+		}
+		saveprevline($_);
+	}
+
+	close $fh or die "could not close file:$!\n";
+
+	if ( $opt_d || $opt_y ) {
+		# skip batch tests if a line range is set
+		last if $opt_C;
+
+		# slurp the whole file
+		open $fh, '<', ($tmpfile ? $tmpfile : $fname) or die "cannot open '$tmpfile':$!\n";
+		my $fulltext = do { local($/); <$fh> };
+		close $fh or die "could not close file:$!\n";
+
+		# global batch tests
+		style($bname, $fulltext) if $opt_y;
+
+		# mdoc batch tests
+		if ( ($type eq "troff") && ($opt_d) && (!$docdate) ) {
+			showline($bname, '-', '.Dd date not set', '', '');
+		}
+	}
+
+	removetempfiles();
+	print "</file>\n";
+}
