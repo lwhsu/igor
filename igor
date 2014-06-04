@@ -1715,7 +1715,7 @@ foreach my $fname (@ARGV) {
 		next unless -r $fname;
 	}
 
-	print "<file name=\"$fname\">";
+	print "<file name=\"$fname\">\n";
 	$fname = writestdinfile() if $fname eq "stdin";
 
 	$bname = basename($fname);
