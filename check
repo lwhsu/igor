@@ -1,5 +1,7 @@
 #!/bin/sh
 
-cat /home/lwhsu/src/igor/head
-/home/lwhsu/src/igor/igor -clntESW `find $1 -name \*.xml`
-cat /home/lwhsu/src/igor/footer
+DATADIR=/home/lwhsu/work/igor
+
+cat ${DATADIR}/head
+${DATADIR}/igor -clntESW `find $1 -name \*.xml`
+cat ${DATADIR}/footer
